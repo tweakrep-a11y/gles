@@ -212,8 +212,11 @@ public final class CloudflareHelper {
                 // 403 autentikasi source lain tidak ikut berubah jadi
                 // prompt Cloudflare. Perbandingan case-insensitive karena
                 // sourceLabel() Westmanga = "Westmanga" sedangkan cleanLabel()
-                // hanya trim tanpa lowercase.
-                if (response.code() == 403 && "westmanga".equalsIgnoreCase(cleanLabel(sourceLabel)) && retry < 2) {
+                // hanya trim tanpa lowercase. PENGECUALIAN: 403 yang membawa
+                // header "X-WM-Visit-Error" adalah masalah visit-token, BUKAN
+                // Cloudflare — biarkan lolos ke pemanggil (Westmanga akan
+                // refresh token dan retry sekali), jangan dijadikan prompt CF.
+                if (response.code() == 403 && "westmanga".equalsIgnoreCase(cleanLabel(sourceLabel)) && response.header("X-WM-Visit-Error") == null && retry < 2) {
                     response.close();
                     queue(client, request, sourceLabel, callback, retry + 1);
                     return;

@@ -20,6 +20,7 @@ import javax.crypto.spec.SecretKeySpec;
 import okhttp3.Call;
 import okhttp3.Callback;
 import okhttp3.HttpUrl;
+import okhttp3.Interceptor;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
 import okhttp3.Response;
@@ -65,7 +66,100 @@ public class Westmanga extends KomikcastClient {
     private static final String SECRET_KEY = "xxxoidj";
 
     private static final long CACHE_TTL = 12L * 60L * 1000L;
-    private static final OkHttpClient CLIENT = MangaHttpClient.newBuilder().connectTimeout(20, TimeUnit.SECONDS).readTimeout(30, TimeUnit.SECONDS).retryOnConnectionFailure(true).build();
+    private static final OkHttpClient CLIENT = MangaHttpClient.newBuilder().addInterceptor(new VisitTokenInterceptor()).connectTimeout(20, TimeUnit.SECONDS).readTimeout(30, TimeUnit.SECONDS).retryOnConnectionFailure(true).build();
+
+    // Visit-token situs (2026-10-24, dari bundle web components-CJfqb9NT.js):
+    // frontend web TIDAK LAGI memakai skema HMAC lama (x-wm-request-signature /
+    // x-wm-accses-key / x-wm-request-time) — di traffic browser jumlahnya NOL.
+    // Sebagai gantinya tiap request API dipasangi header "X-WM-Visit" berisi
+    // token yang diambil dari GET {base}/api/visit-token (JSON: token +
+    // expires_at). Token disimpan di memori saja, dipakai ulang selama masih
+    // berlaku > 300 detik, dan di-refresh bila origin menolaknya (respons 403
+    // + header "X-WM-Visit-Error"). App selama ini tidak mengirim header ini
+    // sama sekali — itulah tersangka utama 403 JSON dari origin, karena
+    // request yang lolos Cloudflare tapi tanpa token valid ditolak origin.
+    // Header HMAC lama tetap dikirim (tidak dihapus) supaya perubahan ini
+    // aditif; yang ditambahkan hanyalah header visit-token.
+    private static final String VISIT_TOKEN_HEADER = "X-WM-Visit";
+    private static final String VISIT_TOKEN_ERROR_HEADER = "X-WM-Visit-Error";
+    private static volatile String visitToken = null;
+    private static volatile long visitTokenExpiresAtSec = 0;
+    private static final Object VISIT_TOKEN_LOCK = new Object();
+    // Klien khusus ambil token: cookie jar bersama (cf_clearance ikut
+    // terkirim) tapi TANPA VisitTokenInterceptor supaya tidak rekursi.
+    private static final OkHttpClient VISIT_TOKEN_CLIENT = MangaHttpClient.newBuilder().connectTimeout(10, TimeUnit.SECONDS).readTimeout(10, TimeUnit.SECONDS).retryOnConnectionFailure(false).build();
+
+    // Interceptor: pasang X-WM-Visit di tiap request API Westmanga, PADA SAAT
+    // KIRIM (bukan saat request dibangun). Ini penting karena request yang
+    // di-retry CloudflareHelper setelah WebView solve adalah objek request
+    // lama — header yang ditempel di sini selalu token terbaru dari cache.
+    private static final class VisitTokenInterceptor implements Interceptor {
+        @Override public Response intercept(Chain chain) throws IOException {
+            Request request = chain.request();
+            String path = request.url().encodedPath();
+            if (request.url().host().equals(apiHost()) && path.startsWith("/api/") && !path.endsWith("/api/visit-token")) {
+                String token = ensureVisitToken();
+                if (token != null && !token.isEmpty()) {
+                    request = request.newBuilder().header(VISIT_TOKEN_HEADER, token).build();
+                }
+            }
+            return chain.proceed(request);
+        }
+    }
+
+    // Cermin perilaku web: pakai ulang token selama expires_at - sekarang >
+    // 300 detik; bila tidak, fetch ulang sekali (single-flight via lock).
+    // Bila fetch gagal, kembalikan token lama (bisa null) — request tetap
+    // jalan tanpa header, dan penolakan origin ditangani jalur 403 di bawah.
+    private static String ensureVisitToken() {
+        long nowSec = System.currentTimeMillis() / 1000L;
+        String cached = visitToken;
+        if (cached != null && !cached.isEmpty() && visitTokenExpiresAtSec - nowSec > 300) return cached;
+        // Jangan lakukan network di main thread.
+        if (Looper.myLooper() == Looper.getMainLooper()) return cached;
+        synchronized (VISIT_TOKEN_LOCK) {
+            nowSec = System.currentTimeMillis() / 1000L;
+            cached = visitToken;
+            if (cached != null && !cached.isEmpty() && visitTokenExpiresAtSec - nowSec > 300) return cached;
+            try {
+                HttpUrl tokenUrl = HttpUrl.parse(api() + "/api/visit-token");
+                if (tokenUrl == null) return cached;
+                Request req = new Request.Builder().url(tokenUrl)
+                        .header("Accept", "application/json")
+                        .header("User-Agent", CloudflareHelper.userAgentForHost(tokenUrl.host()))
+                        .build();
+                Response resp = VISIT_TOKEN_CLIENT.newCall(req).execute();
+                try {
+                    if (resp.isSuccessful() && resp.body() != null) {
+                        JsonObject root = JsonParser.parseString(resp.body().string()).getAsJsonObject();
+                        if (root.has("token") && root.get("token").isJsonPrimitive()) {
+                            String t = root.get("token").getAsString();
+                            long exp = 0;
+                            if (root.has("expires_at") && root.get("expires_at").isJsonPrimitive()) {
+                                try { exp = root.get("expires_at").getAsLong(); } catch (Exception ignored) {}
+                            }
+                            if (t != null && !t.isEmpty()) {
+                                visitToken = t;
+                                visitTokenExpiresAtSec = exp;
+                                return t;
+                            }
+                        }
+                    }
+                } finally {
+                    resp.close();
+                }
+            } catch (Exception ignored) {
+            }
+            return cached;
+        }
+    }
+
+    private static void clearVisitToken() {
+        synchronized (VISIT_TOKEN_LOCK) {
+            visitToken = null;
+            visitTokenExpiresAtSec = 0;
+        }
+    }
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
     private static final MangaMemoryCache<String, MangaPost> DETAIL_CACHE = new MangaMemoryCache<>(64, CACHE_TTL);
     private static final MangaMemoryCache<String, ArrayList<MangaChapter>> CHAPTER_CACHE = new MangaMemoryCache<>(64, CACHE_TTL);
@@ -374,7 +468,9 @@ public class Westmanga extends KomikcastClient {
 
     private void getJson(HttpUrl url, Result<JsonObject> cb) { getJson(url, cb, false); }
 
-    private void getJson(HttpUrl url, Result<JsonObject> cb, boolean isFallback) {
+    private void getJson(HttpUrl url, Result<JsonObject> cb, boolean isFallback) { getJson(url, cb, isFallback, false); }
+
+    private void getJson(HttpUrl url, Result<JsonObject> cb, boolean isFallback, boolean visitRefreshed) {
         // Pola sama seperti Komiku: kalau WebView sudah mengambil body JSON yang
         // lolos Cloudflare untuk URL ini, pakai itu langsung tanpa network.
         String solvedBody = CloudflareHelper.cachedSolvedBody(url.toString());
@@ -396,6 +492,15 @@ public class Westmanga extends KomikcastClient {
                     if (response.code() == 404 && !isFallback) {
                         HttpUrl alt = url.newBuilder().scheme("https").host(HttpUrl.parse(FALLBACK_API).host()).build();
                         MangaCoroutines.main(() -> getJson(alt, cb, true));
+                        return;
+                    }
+                    // Visit-token ditolak origin (403 + header X-WM-Visit-Error):
+                    // cermin perilaku web — buang token lama, ambil yang baru,
+                    // ulang request sekali. Dibatasi sekali supaya tidak loop.
+                    if (response.code() == 403 && response.header(VISIT_TOKEN_ERROR_HEADER) != null && !visitRefreshed) {
+                        response.close();
+                        clearVisitToken();
+                        MangaCoroutines.main(() -> getJson(url, cb, isFallback, true));
                         return;
                     }
                     MangaCoroutines.main(() -> cb.onError("HTTP " + response.code()));
