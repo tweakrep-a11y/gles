@@ -1,0 +1,8 @@
+{
+  "name": "Miku Moe",
+  "description": "Miku Moe - Aplikasi Baca Manga, Manhwa, Manhua dan Nonton Anime terlengkap dengan multi-source, pembaca webtoon, riwayat & favorit.",
+  "permissions": [],
+  "capabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
